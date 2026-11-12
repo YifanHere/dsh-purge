@@ -612,16 +612,139 @@ test("GNU 稀疏条目（typeflag=S）被拒绝", () => {
   assert.throws(() => assertNoTarSymlinks(archive), /GNU 稀疏文件条目/);
 });
 
-test("GNU 长文件名/长链接名条目（L/K）被拒绝", () => {
-  for (const typeflag of ["L", "K"]) {
-    const archive = Buffer.concat([
-      tarBlock({ name: "longname", size: 4, typeflag }),
-      bodyBlocks(Buffer.from("abcd", "utf8")),
-      tarBlock({ name: "x.txt", size: 0 }),
-      Buffer.alloc(BLOCK * 2, 0),
-    ]);
-    assert.throws(() => assertNoTarSymlinks(archive), /GNU 长/, typeflag);
+test("GNU 长链接名条目（K）被拒绝", () => {
+  // K 的数据是下一个条目的链接目标，而那个条目本身是链接 —— 反正要被拒。
+  const archive = Buffer.concat([
+    tarBlock({ name: "longlink", size: 4, typeflag: "K" }),
+    bodyBlocks(Buffer.from("abcd", "utf8")),
+    tarBlock({ name: "x.txt", size: 0 }),
+    Buffer.alloc(BLOCK * 2, 0),
+  ]);
+  assert.throws(() => assertNoTarSymlinks(archive), /GNU 长链接名/);
+});
+
+test("GNU 长文件名条目（L）被接受，长名套到下一条条目", async (t) => {
+  // GNU tar 对超过 100 字节的路径默认写 L，bsdtar 写 PAX x。若拒收 L，
+  // Linux 用户用 GNU tar 打的正常 skill 包会被误拒。
+  const longName = `pkg/${"a".repeat(120)}/SKILL.md`;
+  const linkData = Buffer.concat([Buffer.from(longName, "utf8"), Buffer.alloc(1, 0)]);
+  const content = Buffer.from("---\nname: p\n---\n", "utf8");
+  const archive = Buffer.concat([
+    tarBlock({ name: "././@LongLink", size: linkData.length, typeflag: "L" }),
+    bodyBlocks(linkData),
+    // 真实条目的头部名字被截断到 100 字节
+    tarBlock({ name: longName.slice(0, 100), size: content.length }),
+    bodyBlocks(content),
+    Buffer.alloc(BLOCK * 2, 0),
+  ]);
+  assert.doesNotThrow(() => assertNoTarSymlinks(archive));
+
+  // 解压后必须落在完整长名那个路径上，而不是被截断的头部名。
+  const dir = tmpdir(t);
+  const dest = path.join(dir, "out");
+  extractTarBuffer(archive, dest);
+  assert.ok(fs.existsSync(path.join(dest, longName)), "长名应完整落地");
+});
+
+test("L 条目后跟链接条目时仍被检出", () => {
+  // 长名支持不能成为绕过链接检测的通道。
+  const linkData = Buffer.concat([Buffer.from(`pkg/${"b".repeat(120)}/esc`, "utf8"), Buffer.alloc(1, 0)]);
+  const archive = Buffer.concat([
+    tarBlock({ name: "././@LongLink", size: linkData.length, typeflag: "L" }),
+    bodyBlocks(linkData),
+    tarBlock({ name: "pkg/esc".padEnd(100, " ").slice(0, 100), typeflag: "2", linkname: "../../../victim" }),
+    Buffer.alloc(BLOCK * 2, 0),
+  ]);
+  assert.throws(() => assertNoTarSymlinks(archive), /符号链接\/硬链接条目/);
+});
+
+test("L 与 x 交错时拒绝", () => {
+  const paxData = paxRecord("size", "0");
+  const linkData = Buffer.concat([Buffer.from("pkg/name.txt", "utf8"), Buffer.alloc(1, 0)]);
+  const archive = Buffer.concat([
+    tarBlock({ name: "././@LongLink", size: linkData.length, typeflag: "L" }),
+    bodyBlocks(linkData),
+    tarBlock({ name: "PaxHeader/x", size: paxData.length, typeflag: "x" }),
+    bodyBlocks(paxData),
+    tarBlock({ name: "x.txt", size: 0 }),
+    Buffer.alloc(BLOCK * 2, 0),
+  ]);
+  assert.throws(() => assertNoTarSymlinks(archive), /扩展头交错排列|连续/);
+});
+
+test("V7 普通文件（typeflag 为 NUL）被当作普通文件接受", (t) => {
+  // 老式 V7 归档用 NUL 表示「未设置 typeflag」。`String.fromCharCode(0)`
+  // 得到 "\0"，若只判 `!== ""` 会把这类条目误判为不支持。
+  const head = tarBlock({ name: "old.txt", size: 2 });
+  head[156] = 0; // NUL 而非 '0'
+  reseal(head);
+  const archive = Buffer.concat([head, bodyBlocks(Buffer.from("hi", "utf8")), Buffer.alloc(BLOCK * 2, 0)]);
+  assert.doesNotThrow(() => assertNoTarSymlinks(archive));
+
+  const dir = tmpdir(t);
+  const dest = path.join(dir, "out");
+  assert.doesNotThrow(() => extractTarBuffer(archive, dest));
+  assert.ok(fs.existsSync(path.join(dest, "old.txt")));
+});
+
+test("tar 文件数超过上限时拒绝", () => {
+  // 与 zip 的 MAX_IMPORT_FILES 同口径：改走 Node 解压后不能丢掉这个限制。
+  const entries = [];
+  for (let i = 0; i < 5; i += 1) {
+    entries.push(tarBlock({ name: `f${i}.txt`, size: 1 }), bodyBlocks(Buffer.from("x", "utf8")));
   }
+  entries.push(Buffer.alloc(BLOCK * 2, 0));
+  const archive = Buffer.concat(entries);
+  // 上限设 3，5 个文件应当被拒
+  assert.throws(
+    () => extractTarBuffer(archive, fs.mkdtempSync(path.join(os.tmpdir(), "purge-limit-")), { maxEntries: 3 }),
+    /文件太多/,
+  );
+});
+
+test("真实 tar 的长路径归档被接受（GNU tar 产 L、bsdtar 产 x）", (t) => {
+  // 这条在 ubuntu CI 上由 GNU tar 产出 `L` 条目，在 Windows/macOS 上产出
+  // PAX `x`。两种都要能通过 —— 否则 Linux 用户用 GNU tar 打的正常 skill
+  // 包会被误拒。
+  const dir = tmpdir(t);
+  const src = path.join(dir, "src");
+  const deep = path.join(src, "pkg", "a".repeat(80), "b".repeat(80), "c".repeat(80));
+  fs.mkdirSync(deep, { recursive: true });
+  fs.writeFileSync(path.join(deep, "SKILL.md"), "---\nname: p\n---\n");
+
+  const tar = path.join(dir, "long.tar");
+  try {
+    execFileSync("tar", ["-cf", tar, "-C", src, "pkg"], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  } catch {
+    return t.skip("系统 tar 不可用");
+  }
+  const bytes = fs.readFileSync(tar);
+
+  // 记录这份归档实际用哪种长名机制，便于在 CI 输出里区分
+  const types = new Set();
+  for (let off = 0; off + 512 <= bytes.length;) {
+    if (bytes.subarray(off, off + 512).every((b) => b === 0)) break;
+    types.add(String.fromCharCode(bytes[off + 156] || 0));
+    const sizeText = bytes.toString("ascii", off + 124, off + 136).replace(/\0.*$/s, "").trim();
+    const size = /^[0-7]+$/.test(sizeText) ? Number.parseInt(sizeText, 8) : 0;
+    off += 512 + Math.ceil(size / 512) * 512;
+  }
+  t.diagnostic(`长名机制: typeflag = ${[...types].join(",") || "(无)"}`);
+
+  assert.doesNotThrow(() => assertNoTarSymlinks(bytes), "真实长路径归档不应被拒");
+  const dest = path.join(dir, "out");
+  assert.doesNotThrow(() => extractTarBuffer(bytes, dest));
+  // 确认确实解出了内容（不是空跑）
+  const walk = (d) => {
+    let n = 0;
+    for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+      const full = path.join(d, entry.name);
+      if (entry.isDirectory()) n += walk(full);
+      else n += 1;
+    }
+    return n;
+  };
+  assert.ok(walk(dest) >= 1, "长路径归档应解出至少一个文件");
 });
 
 test("zip 注释里的伪造 EOCD 不能绕过扫描", () => {

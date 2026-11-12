@@ -80,18 +80,24 @@ PAX 的 `size` 记录会覆盖紧随条目头部声明的大小，解压器按**
 
 回归里有四条真实 tar 产出的归档（普通、超长路径、中文名、空文件）确保不被误拦，另有 `linkpath` 记录、损坏记录、无换行记录、全局 size 覆盖五条负向用例。
 
-### 与解压器不一致的格式，一律拒绝而不是猜
+### 与解压器不一致的格式：能读就对齐，读不了才拒绝
 
-扫描器必须与解压器对归档结构得出同一个结论。凡是没有可依赖规范、或两边可能分叉的布局，宁可整份拒绝：
+原则是「扫描器与解压器必须对结构得出同一结论」。但**这个原则只在解压仍由外部工具承担时才需要「对齐」**——解压改到 Node 内实现后，长名语义由我们自己的代码解释，不再有分叉问题。
 
 | 布局 | 处理 | 依据 |
 |---|---|---|
-| 连续多个 `x` PAX 头 | 拒绝 | bsdtar 直接报 `Redundant 'x' header` 并拒绝解压；合并/覆盖语义无规范可依 |
+| 连续多个 `x` PAX 头 | 拒绝 | bsdtar 直接报 `Redundant 'x' header`；合并/覆盖语义无规范可依 |
 | `S`（GNU sparse 旧格式） | 拒绝 | 头部之后额外跟 4 个映射块，只按头部 size 推进会落在映射块中间 |
-| `L` / `K`（GNU 长文件名 / 长链接名） | 拒绝 | 内容是为下一条目保留的名字，与 size 语义无关，合并方式无规范 |
+| `K`（GNU 长链接名） | 拒绝 | 内容是下一条目的**链接目标**，而那个条目本身是链接 |
+| `L`（GNU 长文件名） | **接受** | 布局与普通条目相同，只是把名字搬出来；见下 |
 | `g` 全局 PAX 覆盖 size | 拒绝 | 一个覆盖值无法安全套用到任意多条后续条目 |
+| `x`/`g`/`L` 交错 | 拒绝 | 扩展头必须紧邻它修饰的条目，交错没有可依赖的规范 |
 
-这几类在真实 skill 包里不会出现——本机 bsdtar 的 `-cS` 根本不产 `S` 类型，而是把稀疏文件写成完整普通文件。因此拒绝不误伤正常归档，回归里有真实归档对照。
+**`L` 必须接受**：GNU tar 对超过 100 字节的路径默认写 `L`，bsdtar 写 PAX `x`。拒收 `L` 会让 Linux 用户用 GNU tar 打的正常 skill 包被误拒——而且仓库自己的「真实 tar 长路径放行」用例在 ubuntu CI 上会直接变红（CI 是 GNU tar）。当初拒它的理由是「要和外部 tar 对齐长名语义」，解压改到 Node 后该顾虑已不存在。
+
+实现：`readLongNameEntry()` 读出长名，经 `pending.pathOverride` 套到下一条目，与 PAX `path` 覆盖走同一条 `safeZipName` 校验路径。
+
+`S` 在真实 skill 包里不会出现——本机 bsdtar 的 `-cS` 根本不产 `S`，而是把稀疏文件写成完整普通文件。
 
 ### 头部 checksum：伪头不能引导游标
 
@@ -145,7 +151,7 @@ tar/tar.gz 在扫描前就把字节读进内存，上限由 `maxOutputLength` �
 
 新增四组，均登记进 `npm test`：
 
-- `test/archive-symlink-guard.test.mjs`（39 例，1 例按平台跳过）—— zip 符号链接、tar typeflag 1/2、base-256 大小、无法识别的大小字段、负大小、PAX size 覆盖、PAX linkpath、PAX 损坏记录、UTF-8 记录、连续 `x` 头、`x`/`g` 交错、`S`/`L`/`K` 类型、头部 checksum、伪造 EOCD（同偏移 / 偏移 0 / 留空隙 / 双自洽候选）、声明大小超限、解压器不守声明值、真实 tar 归档不误拦
+- `test/archive-symlink-guard.test.mjs`（47 例，1 例按平台跳过）—— zip 符号链接、tar typeflag 1/2、base-256 大小、无法识别的大小字段、负大小、PAX size 覆盖、PAX linkpath、PAX 损坏记录、UTF-8 记录、连续 `x` 头、`x`/`g`/`L` 交错、`S`/`K` 拒绝、`L` 长名接受、V7 空 typeflag、文件数上限、头部 checksum、伪造 EOCD（同偏移 / 偏移 0 / 留空隙 / 双自洽候选）、声明大小超限、解压器不守声明值、真实 tar 归档不误拦（含 GNU `L` / bsdtar `x` 两条长名机制）
 - `test/plugin-request-host-fence.test.mjs`（16 例）—— 含 `PURGE_TRUSTED_HOSTS` 的实际解析与清空后回落、IPv6 与 IPv4-mapped 回环、裸 IPv6 绑定与带方括号 Host 的匹配
 - `test/community-route-admission.test.mjs`（4 例）—— `/dsh-purge/community` 与其他路由的准入一致性
 - `test/skills-archive-limit.test.mjs`（4 例）—— gzip 炸弹被拒、正常包不受影响、接近上限的包不误伤
